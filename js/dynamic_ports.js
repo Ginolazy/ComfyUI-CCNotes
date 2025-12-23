@@ -13,7 +13,7 @@ export const DynamicPorts = {
      * @param {string} options.secondaryName - Name for secondary port (optional, input mode only)
      * @param {string} options.secondaryDataType - Data type for secondary port (optional, input mode only)
      */
-    setupDynamicPorts: function(nodeType, options) {
+    setupDynamicPorts: function (nodeType, options) {
         const config = {
             startIndex: 1,
             type: "input", // Default to input ports
@@ -31,11 +31,11 @@ export const DynamicPorts = {
         const origOnConnectionsChange = nodeType.prototype.onConnectionsChange;
 
         // Add initial ports when node is created
-        nodeType.prototype.onNodeCreated = function() {
+        nodeType.prototype.onNodeCreated = function () {
             if (origOnNodeCreated) {
                 origOnNodeCreated.apply(this, arguments);
             }
-            
+
             // Ensure at least one port exists
             const baseName = `${config.baseName}_${config.startIndex}`;
             if (!this[portArrayKey] || !this[portArrayKey].some(p => p.name === baseName)) {
@@ -45,32 +45,32 @@ export const DynamicPorts = {
                     this[addPortMethod](`${config.secondaryName}_${config.startIndex}`, config.secondaryDataType);
                 }
             }
-            
+
             // Initialize storage properties
             this.properties = this.properties || {};
             this.properties[`dynamic${isInput ? 'Inputs' : 'Outputs'}`] = true;
-            
+
             // Remove excess starting ports (input mode only)
             if (isInput) {
                 for (let i = this[portArrayKey].length - 1; i >= 0; i--) {
                     const portName = this[portArrayKey][i].name;
-                    if ((portName.startsWith(`${config.baseName}_${config.startIndex + 1}`) || 
+                    if ((portName.startsWith(`${config.baseName}_${config.startIndex + 1}`) ||
                         (config.secondaryName && portName.startsWith(`${config.secondaryName}_${config.startIndex + 1}`)))) {
                         this[removePortMethod](i);
                     }
                 }
             }
         };
-        
+
         // Handle connection changes
-        nodeType.prototype.onConnectionsChange = function(type, index, connected, link) {
+        nodeType.prototype.onConnectionsChange = function (type, index, connected, link) {
             if (origOnConnectionsChange) {
                 origOnConnectionsChange.apply(this, arguments);
             }
-            
+
             // Determine if we need to process this connection change
             const shouldProcess = (isInput && type === 1) || (!isInput && type === 2);
-            
+
             if (shouldProcess) {
                 // Use setTimeout for input mode to avoid potential circular issues
                 if (isInput) {
@@ -80,14 +80,15 @@ export const DynamicPorts = {
                 }
             }
         };
-        
+
         // Update dynamic ports
-        nodeType.prototype.updateDynamicPorts = function() {
+        nodeType.prototype.updateDynamicPorts = function () {
+
             if (!this.graph) return;
-            
+
             const groups = new Set();
             const connectedGroups = new Set();
-            
+
             // Collect current port information
             if (this[portArrayKey]) {
                 this[portArrayKey].forEach((port, index) => {
@@ -103,27 +104,27 @@ export const DynamicPorts = {
                     }
                 });
             }
-            
+
             // Find maximum connected index
             const maxIdx = connectedGroups.size > 0 ? Math.max(...connectedGroups) : 0;
-            
+
             // If all required ports are connected, add new port
             if (connectedGroups.size > 0 && groups.size <= maxIdx) {
                 const nextIdx = groups.size + 1;
                 const newPortName = `${config.baseName}_${nextIdx}`;
                 this[addPortMethod](newPortName, config.dataType);
-                
+
                 // If secondary port exists (input mode only)
                 if (isInput && config.secondaryName) {
                     this[addPortMethod](`${config.secondaryName}_${nextIdx}`, config.secondaryDataType);
                 }
-                
+
                 if (this.graph) {
                     this.graph._version++;
                     this.setDirtyCanvas(true, true);
                 }
             }
-            
+
             // Clean up unconnected excess ports (keep one unconnected port after max connected index)
             Array.from(groups)
                 .filter(idx => !connectedGroups.has(idx) && idx > maxIdx + 1)
@@ -133,7 +134,7 @@ export const DynamicPorts = {
                     if (isInput) {
                         for (let i = this[portArrayKey].length - 1; i >= 0; i--) {
                             const portName = this[portArrayKey][i].name;
-                            if ((portName === `${config.baseName}_${idx}`) || 
+                            if ((portName === `${config.baseName}_${idx}`) ||
                                 (config.secondaryName && portName === `${config.secondaryName}_${idx}`)) {
                                 this[removePortMethod](i);
                             }
@@ -150,7 +151,7 @@ export const DynamicPorts = {
                         }
                     }
                 });
-            
+
             // Update node size and canvas
             if (this.computeSize) {
                 this.computeSize();
@@ -160,9 +161,9 @@ export const DynamicPorts = {
             }
         };
     },
-    
+
     // Compatibility function, maintain compatibility with existing code
-    setupDynamicInputs: function(nodeType, options) {
+    setupDynamicInputs: function (nodeType, options) {
         this.setupDynamicPorts(nodeType, {
             type: "input",
             baseName: options.baseInputName,
@@ -172,9 +173,9 @@ export const DynamicPorts = {
             secondaryDataType: options.secondaryInputType
         });
     },
-    
+
     // Compatibility function, maintain compatibility with existing code
-    setupDynamicOutputs: function(nodeType, options) {
+    setupDynamicOutputs: function (nodeType, options) {
         this.setupDynamicPorts(nodeType, {
             type: "output",
             baseName: options.baseOutputName,

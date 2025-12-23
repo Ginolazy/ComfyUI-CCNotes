@@ -1,427 +1,386 @@
-/** ComfyUI/custom_nodes/CCNotes/js/primitive_advanced.js **/
-
+/** ComfyUI/custom_nodes/CCNotes/js/primitive_plus.js **/
 import { app } from "../../scripts/app.js";
-import { DynamicPorts } from "./dynamic_ports.js";
-
-// Register workflow change event listener
-app.registerExtension({
-    name: "PrimitivePlus_WorkflowChange",
-    async beforeRegisterNodeDef() {
-        const origLoadGraph = app.loadGraph;
-        app.loadGraph = function (graphData) {
-            const result = origLoadGraph.apply(this, arguments);
-            setTimeout(() => {
-                const nodes = app.graph._nodes_by_id;
-                for (const nodeId in nodes) {
-                    const node = nodes[nodeId];
-                    if (node.type === "PrimitivePlus" && typeof node.restoreWidgets === "function") {
-                        node.restoreWidgets();
-                    }
-                }
-            }, 100);
-            return result;
-        };
-    },
-});
+import { ComfyWidgets } from "../../scripts/widgets.js";
 
 app.registerExtension({
-    name: "./primitive_plus.js",
+    name: "PrimitivePlus",
     async beforeRegisterNodeDef(nodeType, nodeData, app) {
         if (nodeData.name === "PrimitivePlus") {
-            DynamicPorts.setupDynamicPorts(nodeType, {
-                type: "output",
-                baseName: "connect_to_widget_input",
-                dataType: "*",
-                startIndex: 1,
-                maxPorts: 1,
-            });
-
             const origOnNodeCreated = nodeType.prototype.onNodeCreated;
             const origOnConnectionsChange = nodeType.prototype.onConnectionsChange;
             const origSerialize = nodeType.prototype.serialize;
             const origConfigure = nodeType.prototype.configure;
 
-            nodeType.prototype.init = function () {
-                this.state = {
-                    connections: {},
-                    widgetValues: {},
-                    widgets: {},
-                };
-            };
-
+            // --- Initialization ---
             nodeType.prototype.onNodeCreated = function () {
                 if (origOnNodeCreated) origOnNodeCreated.apply(this, arguments);
-                this.init();
 
+                // Initial Port Setup
                 if (!this.outputs || this.outputs.length === 0) {
                     this.addOutput("connect_to_widget_input_1", "*");
-                }
-                if (this.outputs && this.outputs.length > 1) {
-                    const firstOutput = this.outputs[0];
-                    this.outputs = [firstOutput];
+                } else if (this.outputs.length > 1) {
+                    // Fix Flash on Creation:
+                    // Python def has 10 ports. Truncate strictly to 1 for clean start.
+                    this.outputs.length = 1;
                 }
 
-                this.size = [this.size[0], 30];
+                // Initialize internal state
+                this.localWidgets = {};
 
-                this.onResize = function () {
-                    if (this.widgets) {
-                        for (const widget of this.widgets) {
-                            if (widget.fullLabel) widget.label = this.truncateLabel(widget.fullLabel);
-                        }
-                    }
-                    this.setDirtyCanvas(true, true);
+                // Track current connected node/slot for each output to detect changes
+                this.connectionState = {};
+
+                // Properties for persistence
+                this.properties = this.properties || {};
+                this.properties.portLabels = this.properties.portLabels || {};
+
+                this.size = [this.size[0], 32]; // Initial size
+
+                // Monitor size changes to update label truncation
+                const origOnResize = this.onResize;
+                this.onResize = function (newSize) {
+                    if (origOnResize) origOnResize.apply(this, arguments);
+                    this.updateLabelsForWidth();
                 };
 
-                this.onWidgetChange = function (outputName, value) {
-                    const connection = this.state.connections[outputName];
-                    if (connection) {
-                        const targetNode = this.graph._nodes_by_id[connection.nodeId];
-                        if (targetNode && targetNode.widgets) {
-                            const targetWidget = targetNode.widgets.find((w) => w.name === connection.inputName);
-                            if (targetWidget) {
-                                targetWidget.value = value;
-                                if (targetWidget.callback) targetWidget.callback(value, targetWidget, targetNode);
-                                if (this.graph) this.graph.setDirtyCanvas(true, true);
+                // Immediately manage ports to ensure clean start (trim excess or add defaults)
+                setTimeout(() => {
+                    this.managePorts();
+                }, 10);
+            };
+
+            // --- Serialization ---
+            nodeType.prototype.serialize = function () {
+                const o = origSerialize ? origSerialize.apply(this, arguments) : {};
+                if (o.widgets) {
+                    // Filter out our dynamic widgets from synthesis
+                    o.widgets = o.widgets.filter(w => !w.name || !w.name.startsWith("connect_to_widget_input_"));
+                    if (o.widgets.length === 0) {
+                        delete o.widgets;
+                    }
+                }
+
+                // Return the serialized object!
+                return o;
+            };
+
+            // --- Configuration / Restore ---
+            nodeType.prototype.configure = function (o) {
+                if (origConfigure) origConfigure.apply(this, arguments);
+
+                // Fix Flash/Ghost Ports:
+                // Python def creates 10 ports. Saved state might have fewer.
+                // Truncate extra ports immediately to prevent 10-port render flash.
+                if (o.outputs && this.outputs && this.outputs.length > o.outputs.length) {
+                    this.outputs.length = o.outputs.length;
+                }
+
+                if (this.widgets) {
+                    // removing widgets in place carefully
+                    for (let i = this.widgets.length - 1; i >= 0; i--) {
+                        if (this.widgets[i].name && this.widgets[i].name.startsWith("connect_to_widget_input_")) {
+                            this.widgets.splice(i, 1);
+                        }
+                    }
+                }
+
+                if (this.properties.portLabels) {
+                    for (let i = 0; i < this.outputs.length; i++) {
+                        if (this.properties.portLabels[i]) {
+                            this.outputs[i].label = this.truncateLabelForWidth(this.properties.portLabels[i]);
+                        }
+                    }
+                }
+
+                // Defer reconstruction to ensure connections are ready (LiteGraph heuristic)
+                setTimeout(() => {
+                    this.managePorts();
+                    this.refreshWidgets();
+                }, 50);
+            };
+
+            // --- Port Management ---
+            nodeType.prototype.managePorts = function () {
+                // Policy: Always have exactly ONE unconnected output at the bottom.
+                // Also, ensure Port 1 exists.
+
+                if (!this.outputs) this.outputs = [];
+
+                // 1. Identify connected ports
+                let lastConnectedIndex = -1;
+                for (let i = 0; i < this.outputs.length; i++) {
+                    if (this.isOutputConnected(i)) {
+                        lastConnectedIndex = i;
+                    }
+                }
+
+                // 2. We need ports up to lastConnectedIndex + 1 (the empty one)
+                const neededPorts = lastConnectedIndex + 2; // e.g. if 0 is connected, we need index 0 and 1. so 2 ports.
+
+                // 3. Add missing ports
+                while (this.outputs.length < neededPorts) {
+                    const idx = this.outputs.length + 1;
+                    this.addOutput(`connect_to_widget_input_${idx}`, "*");
+                }
+
+                // 4. Remove excess ports (from the end)
+                // But NEVER remove if it causes total ports < 1
+                while (this.outputs.length > neededPorts && this.outputs.length > 1) {
+                    const removeIdx = this.outputs.length - 1;
+                    // Clean up properties for the removed port to prevent stale labels on reconnect
+                    if (this.properties.portLabels) {
+                        delete this.properties.portLabels[removeIdx];
+                    }
+                    this.removeOutput(removeIdx);
+                }
+
+                // 5. Restore labels if needed (though addOutput/removeOutput shift things?)
+                // Actually LiteGraph shifts links on removeOutput(i), so if we remove from end it's safe.
+
+                // Verify labels match properties (use truncated version for comparison and assignment)
+                for (let i = 0; i < this.outputs.length; i++) {
+                    if (this.properties.portLabels[i]) {
+                        const truncatedLabel = this.truncateLabelForWidth(this.properties.portLabels[i]);
+                        if (this.outputs[i].label !== truncatedLabel) {
+                            this.outputs[i].label = truncatedLabel;
+                        }
+                    }
+                }
+            };
+
+            // --- Widget Reconstruction ---
+            nodeType.prototype.refreshWidgets = function () {
+                // 1. Cleanup orphaned widgets (from removed ports)
+                // This is critical because managePorts destroys the port but doesn't know about the widget.
+                if (this.widgets) {
+                    for (let i = this.widgets.length - 1; i >= 0; i--) {
+                        const w = this.widgets[i];
+                        if (w.name && w.name.startsWith("connect_to_widget_input_")) {
+                            const portExists = this.outputs && this.outputs.some(o => o.name === w.name);
+                            if (!portExists) {
+                                this.removeLocalWidget(w.name);
                             }
                         }
                     }
+                }
 
-                    this.state.widgetValues[outputName] = value;
-                    const outputIndex = this.outputs.findIndex((o) => o.name === outputName);
-                    if (outputIndex >= 0) {
-                        const outVal = this.formatValue(value, true);
-                        this.setOutputData(outputIndex, outVal);
-                        this.notifyConnectedNodes(outputIndex);
+                // 2. Rebuilds widgets based on CURRENT connections.
+
+                // Iterate all outputs
+                for (let i = 0; i < this.outputs.length; i++) {
+                    const output = this.outputs[i];
+                    const outputName = output.name;
+
+                    if (!this.isOutputConnected(i)) {
+                        // If not connected, remove any specific widget
+                        this.removeLocalWidget(outputName);
+                        continue;
                     }
 
-                    const widget = this.widgets.find((w) => w.name === outputName);
-                    if (widget && widget.fullLabel) widget.label = this.truncateLabel(widget.fullLabel);
+                    // Connected: Find target
+                    const linkId = output.links[0]; // Assuming single link for simplicity, or grab first valid
+                    const link = app.graph.links[linkId];
+                    if (!link) continue;
 
-                    return value;
-                };
+                    const targetNode = app.graph.getNodeById(link.target_id);
+                    if (!targetNode) continue;
 
-                this.onNodeMoved = function () {
-                    this.restoreWidgets();
-                };
-                this.onNodeSelected = function () {
-                    this.restoreWidgets();
-                };
-            };
+                    const targetInput = targetNode.inputs[link.target_slot];
+                    if (!targetInput) continue;
 
-            nodeType.prototype.onConnectionsChange = function (type, index, connected, link_info) {
-                if (origOnConnectionsChange) origOnConnectionsChange.call(this, type, index, connected, link_info);
-                if (type !== LiteGraph.OUTPUT || !this.outputs || index >= this.outputs.length) return;
-
-                const outputName = this.outputs[index].name;
-
-                if (connected && link_info) {
-                    const targetNode = this.graph._nodes_by_id[link_info.target_id];
-                    if (!targetNode) return;
-
-                    const targetSlot = link_info.target_slot;
-                    const targetInput = targetNode.inputs[targetSlot];
-                    if (!targetInput) return;
-
-                    this.state.connections[outputName] = {
-                        nodeId: link_info.target_id,
-                        slot: targetSlot,
-                        inputName: targetInput.name,
-                        type: targetInput.type,
-                    };
-
+                    // Identify target widget (if any)
                     let targetWidget = null;
                     if (targetNode.widgets) {
-                        targetWidget = targetNode.widgets.find((w) => w.name === targetInput.name);
+                        targetWidget = targetNode.widgets.find(w => w.name === targetInput.name);
                     }
 
                     if (targetWidget) {
-                        this.outputs[index].label = targetInput.name;
-                        this.createMatchingWidget(outputName, targetInput.type, targetWidget, targetNode);
-                    } else {
-                        this.setOutputData(index, [""]);
-                        this.state.widgetValues[outputName] = "";
-                    }
-                } else {
-                    this.removeWidget(outputName);
-                    delete this.state.connections[outputName];
-                    this.outputs[index].label = null;
+                        // Check if we already have a widget for this port
+                        let existingWidget = this.findWidgetByName(outputName);
 
-                    const currentValue = this.getOutputData(index);
-                    if (currentValue === undefined || currentValue === null) {
-                        this.setOutputData(index, [""]);
-                    }
-                }
-            };
-
-            nodeType.prototype.serialize = function () {
-                const data = origSerialize ? origSerialize.apply(this, arguments) : {};
-                if (this.state) {
-                    data.state = {
-                        connections: this.state.connections,
-                        widgetValues: this.state.widgetValues,
-                        widgets: {},
-                    };
-                    if (this.widgets) {
-                        for (const widget of this.widgets) {
-                            if (widget.name) {
-                                data.state.widgets[widget.name] = {
-                                    name: widget.name,
-                                    type: widget.type,
-                                    value: widget.value,
-                                    options: widget.options,
-                                    fullLabel: widget.fullLabel,
-                                };
+                        // Check if connection changed (different target widget type/name)
+                        // simpler to just recreate if anything looks off, but let's try to update if possible
+                        if (!existingWidget) {
+                            this.createLocalWidget(outputName, targetWidget, targetNode);
+                            if (!this.properties.portLabels[i]) {
+                                // Default Label: "NodeTitle : InputName"
+                                const tTitle = targetNode.title || targetNode.type;
+                                let fullLabel = `${tTitle}: ${targetInput.name}`;
+                                this.properties.portLabels[i] = fullLabel; // Save full label
+                                this.outputs[i].label = this.truncateLabelForWidth(fullLabel); // Display truncated
+                            } else {
+                                // Update label with truncation if needed
+                                this.outputs[i].label = this.truncateLabelForWidth(this.properties.portLabels[i]);
                             }
+                        } else {
+                            // Update label for existing widget
+                            this.outputs[i].label = this.truncateLabelForWidth(this.properties.portLabels[i]);
                         }
-                    }
-                }
-                return data;
-            };
-
-            nodeType.prototype.configure = function (info) {
-                if (origConfigure) origConfigure.apply(this, arguments);
-                if (info.state) {
-                    this.state = this.state || {};
-                    this.state.connections = info.state.connections || {};
-                    this.state.widgetValues = info.state.widgetValues || {};
-                    this.state.widgets = info.state.widgets || {};
-                    setTimeout(() => this.restoreWidgets(), 10);
-                }
-            };
-
-            // ----------- restoreWidgets (Sequence Preserved Version) -------------
-            nodeType.prototype.restoreWidgets = function () {
-                if (!this.state || !this.state.connections || !this.state.widgets) return;
-
-                const originalWidgets = this.widgets ? [...this.widgets] : [];
-
-                for (let oIndex = 0; oIndex < (this.outputs ? this.outputs.length : 0); oIndex++) {
-                    const output = this.outputs[oIndex];
-                    const outputName = output.name;
-                    const connection = this.state.connections[outputName];
-                    if (!connection) continue;
-
-                    const targetNode = this.graph._nodes_by_id[connection.nodeId];
-                    if (!targetNode) continue;
-                    if (!output.links || output.links.length === 0) continue;
-
-                    const hasValidLink = output.links.some((linkId) => {
-                        const link = this.graph.links[linkId];
-                        return link && link.target_id === connection.nodeId && link.target_slot === connection.slot;
-                    });
-                    if (!hasValidLink) continue;
-
-                    const widgetConfig = this.state.widgets[outputName];
-                    if (!widgetConfig) continue;
-
-                    let targetWidget = null;
-                    if (targetNode.widgets) {
-                        targetWidget = targetNode.widgets.find((w) => w.name === connection.inputName);
-                    }
-
-                    const fakeTargetWidget = targetWidget || {
-                        name: widgetConfig.name || connection.inputName,
-                        type: widgetConfig.type || "string",
-                        value: widgetConfig.value,
-                        options: widgetConfig.options || {},
-                        label: widgetConfig.fullLabel || widgetConfig.name,
-                    };
-
-                    let existingWidget = this.widgets.find((w) => w.name === outputName);
-                    if (existingWidget) {
-                        existingWidget.value = fakeTargetWidget.value;
-                        existingWidget.label = this.truncateLabel(this.createLabel(targetNode, fakeTargetWidget));
-                        existingWidget.fullLabel = this.createLabel(targetNode, fakeTargetWidget);
                     } else {
-                        const widget = this.createMatchingWidget(outputName, connection.type, fakeTargetWidget, targetNode);
-                        if (widget) this.widgets.push(widget);
+                        // Connected to a slot with no widget (e.g. latent, image input)
+                        // Remove our widget if it exists
+                        this.removeLocalWidget(outputName);
                     }
-
-                    this.state.widgetValues[outputName] = fakeTargetWidget.value;
                 }
 
-                if (this.computeSize) this.computeSize();
+                this.sortWidgets();
+                if (this.computeSize) {
+                    try {
+                        const minSize = this.computeSize();
+                        // Preserve manual size if larger, but grow if needed
+                        const currentSize = this.size;
+                        this.setSize([
+                            Math.max(currentSize[0], minSize[0]),
+                            Math.max(currentSize[1], minSize[1])
+                        ]);
+                    } catch (e) { }
+                }
                 this.setDirtyCanvas(true, true);
             };
 
-            // ----------- Other methods keep v2 logic -------------
-            nodeType.prototype.isComboType = function (type, targetWidget) {
-                if (Array.isArray(type) || (typeof type === "string" && type.toUpperCase() === "COMBO")) return true;
-                if (targetWidget.type === "combo") return true;
-                if (targetWidget.options) {
-                    return (
-                        Array.isArray(targetWidget.options.values) ||
-                        Array.isArray(targetWidget.options.options) ||
-                        (typeof targetWidget.options.values === "object" && targetWidget.options.values !== null)
-                    );
-                }
-                return false;
-            };
-
-            nodeType.prototype.formatValue = function (value, forOutput = true) {
-                if (value === null || value === undefined) return forOutput ? [""] : "";
-                if (!forOutput) return value;
-                if (Array.isArray(value)) return value.length === 0 ? [""] : value;
-                return [value];
-            };
-
-            nodeType.prototype.createLabel = function (targetNode, targetWidget) {
-                const prefix = targetNode.title || targetNode.type || "Widget";
-                const widgetName = targetWidget.label || targetWidget.name || "";
-                return `${prefix}•${widgetName}`;
-            };
-
-            nodeType.prototype.createMatchingWidget = function (outputName, type, targetWidget, targetNode) {
-                this.removeWidget(outputName);
-
-                const fullLabel = this.createLabel(targetNode, targetWidget);
-
-                let widget = null;
-
-                if (this.isComboType(type, targetWidget)) {
-                    widget = this.addWidget(
-                        "combo",
-                        outputName,
-                        targetWidget.value,
-                        (v) => this.onWidgetChange(outputName, v),
-                        targetWidget.options
-                    );
-                } else {
-                    let widgetType = "string";
-                    if (type === "BOOLEAN") widgetType = "toggle";
-                    else if (type === "INT" || type === "FLOAT") widgetType = "number";
-
-                    widget = this.addWidget(
-                        widgetType,
-                        outputName,
-                        targetWidget.value,
-                        (v) => this.onWidgetChange(outputName, v),
-                        targetWidget.options
-                    );
-                }
-
-                if (widget) {
-                    widget.fullLabel = fullLabel;
-                    widget.label = this.truncateLabel(fullLabel);
-
-                    this.state.widgetValues[outputName] = targetWidget.value;
-
-                    const outputIndex = this.outputs.findIndex((o) => o.name === outputName);
-                    if (outputIndex >= 0) {
-                        this.setOutputData(outputIndex, this.formatValue(targetWidget.value, true));
-                    }
-
-                    this.state.widgets[outputName] = {
-                        name: widget.name,
-                        type: widget.type,
-                        value: widget.value,
-                        options: widget.options,
-                        fullLabel: widget.fullLabel,
-                    };
-                }
-
-                if (this.computeSize) this.computeSize();
-                return widget;
-            };
-
-            nodeType.prototype.notifyConnectedNodes = function (outputIndex) {
-                const output = this.outputs[outputIndex];
-                if (!output || !output.links || output.links.length === 0) return;
-
-                const outputValue = this.getOutputData(outputIndex) || [""];
-
-                for (const linkId of output.links) {
-                    const link = this.graph.links[linkId];
-                    if (!link) continue;
-
-                    const targetNode = this.graph.getNodeById(link.target_id);
-                    if (!targetNode) continue;
-
-                    this.notifyTargetNode(targetNode, link.target_slot, outputValue);
-                }
-
-                if (this.graph) {
-                    this.graph._version++;
-                    this.graph.setDirtyCanvas(true, true);
-                }
-            };
-
-            nodeType.prototype.notifyTargetNode = function (targetNode, targetSlot, outputValue) {
-                if (typeof targetNode.onInputChanged === "function") {
-                    targetNode.onInputChanged(targetSlot, outputValue);
-                }
-                if (targetNode.inputs_data) {
-                    const inputName = targetNode.inputs[targetSlot]?.name;
-                    if (inputName) targetNode.inputs_data[inputName] = outputValue;
-                }
-                if (typeof targetNode.onExecuted === "function") {
-                    targetNode.onExecuted();
-                }
-            };
-
-            nodeType.prototype.removeWidget = function (name) {
+            // --- Sorting & Sizing ---
+            nodeType.prototype.sortWidgets = function () {
                 if (!this.widgets) return;
-                this.widgets = this.widgets.filter((w) => w.name !== name);
-                if (this.computeSize) this.computeSize();
-                this.setDirtyCanvas(true, true);
+                this.widgets.sort((a, b) => {
+                    const getIdx = (name) => {
+                        const match = name.match(/connect_to_widget_input_(\d+)/);
+                        return match ? parseInt(match[1]) : 99999;
+                    };
+                    return getIdx(a.name) - getIdx(b.name);
+                });
             };
 
-            nodeType.prototype.truncateLabel = function (label) {
-                if (!label) return "";
-                const nodeWidth = this.size[0];
+            // --- Helpers ---
+            nodeType.prototype.truncateLabelForWidth = function (fullLabel) {
+                if (!fullLabel) return "";
+                const nodeWidth = this.size[0] || 210;
                 const margin = 20;
                 const portWidth = 20;
                 const availableWidth = nodeWidth - margin * 2 - portWidth;
-                const charWidth = 8;
+                const charWidth = 10;
                 const maxChars = Math.floor(availableWidth / charWidth);
-                if (label.length <= maxChars) return label;
-                return "..." + label.slice(-maxChars + 3);
+
+                if (fullLabel.length <= maxChars) return fullLabel;
+
+                // Left truncation: "..." + rightmost characters
+                return "..." + fullLabel.slice(-maxChars + 3);
             };
 
-            nodeType.prototype.onExecute = function () {
-                if (this.widgets && this.outputs) {
-                    for (const widget of this.widgets) {
-                        const outputIndex = this.outputs.findIndex((o) => o.name === widget.name);
-                        if (outputIndex >= 0) {
-                            this.setOutputData(outputIndex, this.formatValue(widget.value, true));
+            nodeType.prototype.updateLabelsForWidth = function () {
+                // Update all port labels based on current width
+                if (!this.outputs || !this.properties.portLabels) return;
+
+                for (let i = 0; i < this.outputs.length; i++) {
+                    if (this.properties.portLabels[i]) {
+                        const truncatedLabel = this.truncateLabelForWidth(this.properties.portLabels[i]);
+                        // Update port label
+                        this.outputs[i].label = truncatedLabel;
+
+                        // Update corresponding widget if exists
+                        const outputName = this.outputs[i].name;
+                        const widget = this.findWidgetByName(outputName);
+                        if (widget) {
+                            widget.label = truncatedLabel;
                         }
+                    }
+                }
+                this.setDirtyCanvas(true, true);
+            };
+
+            nodeType.prototype.findWidgetByName = function (name) {
+                if (!this.widgets) return null;
+                return this.widgets.find(w => w.name === name);
+            }
+
+            nodeType.prototype.removeLocalWidget = function (name) {
+                if (!this.widgets) return;
+                const idx = this.widgets.findIndex(w => w.name === name);
+                if (idx !== -1) {
+                    const w = this.widgets[idx];
+                    // DOM Cleanup for custom widgets
+                    if (w.inputEl) {
+                        try { w.inputEl.remove(); } catch (e) { }
+                    }
+                    if (w.element) {
+                        try { w.element.remove(); } catch (e) { }
+                    }
+                    this.widgets.splice(idx, 1);
+
+                    // Also clear label?
+                    const portIdx = this.outputs.findIndex(o => o.name === name);
+                    if (portIdx !== -1) {
+                        this.outputs[portIdx].label = null;
+                        delete this.properties.portLabels[portIdx];
                     }
                 }
             };
 
-            nodeType.prototype.onExecuted = function (message) {
+            nodeType.prototype.createLocalWidget = function (name, targetWidget, targetNode) {
+                // Determine type
+                let type = "string";
+                let options = { ...targetWidget.options };
+
+                const isCombo = targetWidget.type === "combo" || Array.isArray(options.values);
+                const isNumber = targetWidget.type === "number" || typeof targetWidget.value === "number";
+                const isBoolean = targetWidget.type === "toggle" || typeof targetWidget.value === "boolean";
+
+                let w;
+                const callback = (v) => {
+                    // Update target
+                    targetWidget.value = v;
+                    if (targetWidget.callback) {
+                        targetWidget.callback(v, app.canvas, targetNode, app.canvas.getPointerPos()); // passing somewhat fake args
+                    }
+                    targetNode.setDirtyCanvas(true, true);
+                };
+
+                if (isCombo) {
+                    w = this.addWidget("combo", name, targetWidget.value, callback, options);
+                } else if (isBoolean) {
+                    w = this.addWidget("toggle", name, targetWidget.value, callback, options);
+                } else if (isNumber) {
+                    w = this.addWidget("number", name, targetWidget.value, callback, options);
+                } else {
+                    // String or custom
+                    if (targetWidget.type === "customtext" || options?.multiline) {
+                        options.multiline = true;
+                        // Use ComfyWidgets to create authentic multiline widget
+                        const widgetObj = ComfyWidgets["STRING"](this, name, ["STRING", options], app);
+                        w = widgetObj.widget;
+                        w.value = targetWidget.value;
+                        w.callback = callback;
+                    } else {
+                        w = this.addWidget("string", name, targetWidget.value, callback, options);
+                    }
+                }
+
+                // Label formatting - direct label assignment with truncation
+                const wLabel = targetWidget.label || targetWidget.name;
+                // Get the port index to retrieve the full label
+                const portIdx = this.outputs.findIndex(o => o.name === name);
+                if (portIdx !== -1 && this.properties.portLabels[portIdx]) {
+                    // Store full label and set truncated label directly
+                    w.fullLabel = this.properties.portLabels[portIdx];
+                    w.label = this.truncateLabelForWidth(w.fullLabel);
+                } else {
+                    w.label = wLabel;
+                }
+                return w;
+            };
+
+            // --- Event Handlers ---
+            nodeType.prototype.onConnectionsChange = function (type, index, connected, link_info) {
+                if (origOnConnectionsChange) origOnConnectionsChange.apply(this, arguments);
+                if (type !== 2) return;
                 try {
-                    if (message?.data?.[0]) {
-                        const data = message.data[0];
-                        if (typeof data === "object" && data !== null) {
-                            for (const key in data) {
-                                if (key.startsWith("connect_to_widget_input_")) {
-                                    const outputIndex = this.outputs.findIndex((o) => o.name === key);
-                                    if (outputIndex >= 0) {
-                                        const value = this.formatValue(data[key], true);
-                                        this.setOutputData(outputIndex, value);
-                                        this.state.widgetValues[key] = Array.isArray(value) && value.length === 1 ? value[0] : value;
-                                        this.notifyConnectedNodes(outputIndex);
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if (this.widgets) {
-                        for (const widget of this.widgets) {
-                            const outputIndex = this.outputs.findIndex((o) => o.name === widget.name);
-                            if (outputIndex >= 0) {
-                                this.setOutputData(outputIndex, this.formatValue(widget.value, true));
-                            }
-                        }
-                    }
-
-                    this.setDirtyCanvas(true, true);
-                } catch (err) {
-                    console.error("Primitive (Advanced) onExecuted error:", err);
+                    this.managePorts();
+                    setTimeout(() => {
+                        try { this.refreshWidgets(); } catch (e) { }
+                    }, 20);
+                } catch (e) {
                 }
             };
+
         }
-    },
+    }
 });

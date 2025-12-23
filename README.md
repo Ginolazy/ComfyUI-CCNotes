@@ -122,6 +122,8 @@ A versatile node for **previewing data and controlling execution**.
 - `CropByMask`, `CropByMaskRestore` – Crop by mask and restore seamlessly  
 - `ImageConcat`, `ImageConcatRestore` – Concatenate images and restore layout  
 - `ImageMask_Scale`, `ImageMask_ScaleRestore` – Scale images or masks and restore originals
+- `FluxKontextImageCompensate` – Expands canvas to compensate for Kontext model stretching (approx 5.2%)
+- `FluxKontextImageRestore` – Restores image to original aspect ratio/composition, with optional pixel-perfect auto-alignment
 
 ---
 

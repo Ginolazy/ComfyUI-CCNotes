@@ -202,7 +202,7 @@ class AnyPreview(SaveImage):
     def INPUT_TYPES(s):
         return {
             "required": {
-                "preview_text": ("STRING", {"default": "Text Preview", "multiline": True, "forceInput": False}),
+                "preview_text": ("STRING", {"default": "", "multiline": True, "forceInput": False}),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO", "unique_id": "UNIQUE_ID"},
         }
@@ -562,16 +562,12 @@ class PrimitivePlus:
             }
         }
 
-    RETURN_TYPES = tuple(any_type for _ in range(MAX_FLOW_PORTS))
-    RETURN_NAMES = tuple(f"connect_to_widget_input_{i+1}" for i in range(MAX_FLOW_PORTS))
+    RETURN_TYPES = (any_type,) * MAX_FLOW_PORTS
+    RETURN_NAMES = tuple(f"connect_to_widget_input_{i}" for i in range(1, MAX_FLOW_PORTS + 1))
     FUNCTION = "proxy_widget"
     CATEGORY = "CCNotes/Utils"
-    OUTPUT_IS_LIST = tuple(True for _ in range(MAX_FLOW_PORTS))
+    OUTPUT_IS_LIST = (True,) * MAX_FLOW_PORTS
     DESCRIPTION = "Manages and proxies multiple Primitive-style widgets from different nodes in a single control hub."
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        return float("NaN")
 
     def normalize_value(self, value):
         if isinstance(value, list) and len(value) >= 2 and isinstance(value[1], int):
@@ -589,12 +585,15 @@ class PrimitivePlus:
             for key, value in kwargs.items():
                 if key.startswith("connect_to_widget_input"):
                     input_values[key] = self.normalize_value(value)
+            
+            # Fallback to prompt if inputs not in kwargs (though usually they are)
             if not input_values and prompt and unique_id:
                 node_info = prompt.get(str(unique_id), {})
                 if node_info and 'inputs' in node_info:
                     for key, value in node_info['inputs'].items():
                         if key.startswith("connect_to_widget_input"):
                             input_values[key] = self.normalize_value(value)
+                            
             output_values = []
             for i in range(MAX_FLOW_PORTS):
                 port_key = f"connect_to_widget_input_{i+1}"
@@ -624,30 +623,7 @@ class SwitchAny:
 
     def switch(self, switch, true=None, false=None):
         return (true if switch else false,)
-
-class SwitchAuto:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "optional": {
-                "input1": (any_type,),
-                "input2": (any_type,),
-            }
-        }
-
-    RETURN_TYPES = (any_type,)
-    RETURN_NAMES = ("output",)
-    FUNCTION = "switch"
-    CATEGORY = "CCNotes/Utils"
-
-    def switch(self, input1=None, input2=None):
-        if input1 is not None:
-            return (input1,)
-        elif input2 is not None:
-            return (input2,)
-        else:
-            return (None,)
-
+        
 class SwitchAnyMute:
     @classmethod
     def INPUT_TYPES(cls):
@@ -679,6 +655,29 @@ class SwitchAnyMute:
 
     def switch(self, switch, true=None, false=None):
         return (true if switch else false,)
+
+class SwitchAuto:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "optional": {
+                "input1": (any_type,),
+                "input2": (any_type,),
+            }
+        }
+
+    RETURN_TYPES = (any_type,)
+    RETURN_NAMES = ("output",)
+    FUNCTION = "switch"
+    CATEGORY = "CCNotes/Utils"
+
+    def switch(self, input1=None, input2=None):
+        if input1 is not None:
+            return (input1,)
+        elif input2 is not None:
+            return (input2,)
+        else:
+            return (None,)
 
 class SwitchOutput:
     @classmethod
