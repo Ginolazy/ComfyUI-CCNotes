@@ -1,3 +1,10 @@
+⚠️ Archived — No longer maintained
+
+CCNotes has been integrated into ComfyPanel and is no longer maintained as a separate project.
+
+Please use ComfyPanel instead.
+
+
 # CCNotes Custom Nodes for ComfyUI 🎨⚡
 
 A powerful and thoughtfully designed collection of custom nodes for ComfyUI, covering **workflow control, image & mask processing, previews, and text utilities**.  
